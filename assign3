@@ -1,0 +1,607 @@
+/**********************************************************************************
+ *   Huy Trieu
+ *   onid: trieuh
+ *   CS344: OS1 Summer 2021
+ *   Assignment3 : smallsh 
+ *   Sources: Office Hours with Michael Slater, Chris Buss, Modules 4 and 5 on Canvas, programiz.com, man7.org, geeksforgeeks and stackoverflow.
+ COMPILATION: gcc -std=c11 -Wall -Werror -g3 ass3.c -o smallsh
+ execution: smallsh
+**********************************************************************************/
+
+
+/**********************************************************************************
+* Headers
+**********************************************************************************/
+#define _POSIX_C_SOURCE 200809L
+#define MAX_PROCESSES 256
+#include <assert.h>
+#include <stdio.h>
+#include <stdbool.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <signal.h>
+
+#define MAX 2048 // max length of command
+#define MAX_ARGS 512 // max arguments
+
+/**********************************************************************************
+* Globals
+**********************************************************************************/
+int allowBG = 1;
+int lastExitStatus = 0;
+int num_processes = 0;
+int processes[MAX_PROCESSES] = {0};
+
+/**********************************************************************************
+* Prototypes
+**********************************************************************************/
+void checkForeground(int);
+void check_background();
+char *expand_token(char *s); 
+
+
+/**********************************************************************************
+* Struct for parsing command line
+**********************************************************************************/
+struct command
+{
+    char *command;
+    char *args[MAX_ARGS];
+    char *input_file;
+    char *output_file;
+    int is_bg;
+};
+
+/**********************************************************************************
+*Purpose: Used for setting some background signals
+*Input: sigset_t *
+* Output/return type: void
+**********************************************************************************/
+void sigsetmost(sigset_t* set)
+{
+    sigfillset(set);
+    sigdelset(set,SIGBUS);
+    sigdelset(set,SIGFPE);
+    sigdelset(set,SIGILL);
+    sigdelset(set,SIGSEGV);
+}
+
+/**********************************************************************************
+* Purpose: Used in Parent, adds the num processes in processes[] array
+* Input: int
+* Output/return type: void
+**********************************************************************************/
+void add_process(int process){
+    for (int i = 0; i < MAX_PROCESSES; i++)
+    {
+        if (processes[i] == 0)
+        {
+            //printf("Adding: %d\n", process);
+            //fflush(stdout);
+            processes[i] = process;
+            break;
+        }
+    }
+}
+
+/**********************************************************************************
+* Purpose: Used in kill_bg_proocess(), sets the processes[] at ith element to 0.
+* Input: int
+* Output/return type: void
+**********************************************************************************/
+void remove_process(int process){
+    for (int i = 0; i < MAX_PROCESSES; i++)
+    {
+        if (processes[i] == process)
+        {
+            //printf("Removing: %d\n", process);
+            //fflush(stdout);
+            processes[i] = 0;
+            break;
+        }
+    }
+}
+
+/**********************************************************************************
+* Purpose: Used in kill_bg_proocess(), prints an output, flush stdout, kills the process at the ith element, sets it to 0.
+* Input: None
+* Output/return type: void
+**********************************************************************************/
+void kill_active_processes(){
+    for (int i = 0; i < MAX_PROCESSES; i++)
+    {
+        if (processes[i] != 0)
+        {
+            printf("Killing %d\n", processes[i]);
+            fflush(stdout);
+            kill(processes[i], SIGKILL); 
+            processes[i] = 0;
+        }
+    }
+}
+
+/**********************************************************************************
+* Purpose: Used in exit_func(), used to kill background processed. Calls remove_process() and kill_active_processed(). 
+* Input: None
+* Output/return type: void
+**********************************************************************************/
+void kill_bg_processes(){
+    int status;
+    int pid;
+    while((pid = waitpid(-1, &status, WNOHANG)) > 0){
+        remove_process(pid);
+    }
+    kill_active_processes();
+}
+
+/**********************************************************************************
+* Purpose: Used when user types 'exit' in command line. sets up to kill processed to prevent zombie process. 
+* Input: None
+* Output/return type: void
+**********************************************************************************/
+void exit_func()
+{
+    kill_bg_processes();
+    exit(0);
+}
+
+/**********************************************************************************
+* Purpose: Used in run_build_in() and check_background(). Prints the exit value and the signal number. 
+* Input: int
+* Output/return type: void
+**********************************************************************************/
+void print_status(int exit_status)
+{
+    if(WIFEXITED(exit_status)) 
+    {
+        printf("exit value: %d\n", WEXITSTATUS(exit_status));
+    }
+    else 
+    {
+        printf("terminated by signal: %d\n", WTERMSIG(exit_status));
+    }    
+}
+
+/**********************************************************************************
+* Purpose: Signal Handler for ctrl-z to force process to foreground 
+* Input: int
+* Output/return type: void
+**********************************************************************************/
+static void handle_sigtstp(int sig)
+{
+    if(allowBG == 1)
+    {
+        char* message = "Entering foreground-only mode (& is now ignored)\n";
+		write(1, message, 49);
+        allowBG = 0;
+    }
+    else
+    {
+        char* message = "Exiting foreground-only mode\n";
+		write(1, message, 29);
+        allowBG = 1;
+    }
+}
+
+/**********************************************************************************
+* Purpose: helper function to check char*
+* Input: char*
+* Output/return type: char*
+**********************************************************************************/
+char *safe(char *s) {
+    if (s) return s;
+    return "NULL";
+}
+
+/**********************************************************************************
+* Purpose: Helper function usedto show the command that was entered. Currently does not print to match the outputs in the script.
+* Input: struct command
+* Output/return type: void
+**********************************************************************************/
+void print_command(struct command *cmd) 
+{
+   // printf("command: %s\n", safe(cmd->command));
+    //printf("input: %s\n", safe(cmd->input_file));
+    //printf("output: %s\n", safe(cmd->output_file));
+    //printf("background: %d\n", cmd->is_bg);
+
+    for (int i = 0; i < MAX_ARGS; i++)
+    {
+        if (!cmd->args[i])
+        {
+            break;
+        }
+        //printf("%d | %s\n", i, safe(cmd->args[i]));
+    }
+}
+
+/**********************************************************************************
+* Purpose: check if the char* is a valid criteria from command line (empty, \0, '\n', # are considered blanks)
+* Input: char*
+* Output/return type: int
+**********************************************************************************/
+int isValid(char* s)
+{
+    if(!s) return 0; //if its null return 0
+    if(s[0] == '\0') return 0; // check the first character, if its null
+    if(s[0] == '\n') return 0; // blank line
+    if(s[0] == '#') return 0; // # means comment
+
+    return 1;
+}
+
+/**********************************************************************************
+* Purpose: helper function to find if tokens have a '>' , '<' , or '&' symbol
+* Input: char*, char*
+* Output/return type: int
+**********************************************************************************/
+int findSymbol(char* tokens[MAX_ARGS], char* symbol) // 
+{
+    for(int i = 0; i < MAX_ARGS; i++)
+    {
+        if(!tokens[i])
+        {
+            break;
+        }
+        if(!strcmp(tokens[i], symbol))
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/**********************************************************************************
+* Purpose: used in read_line() to parse the command line into tokens, and also finding symbols used.
+* Input: char*
+* Output/return type: struct command
+**********************************************************************************/
+struct command *parseLine(char* line) //parsing the line
+{
+    char* tokens [MAX_ARGS] = {0};
+    char* savePtr;
+    int tokenIndex = 0;
+
+    char* token = strtok_r(line," \n", &savePtr); // token will take 1st element of 'line'
+    tokens[0] = expand_token(token);
+    tokenIndex++; 
+
+    while((token = strtok_r(NULL," \n", &savePtr)) !=NULL ) // while it continues to add into token, will stop when it runs out of tokens
+    {
+        tokens[tokenIndex] = expand_token(token);
+        tokenIndex++;
+    }
+
+    assert(tokenIndex >= 1);
+    // > < &
+    int GT = findSymbol(tokens, ">");
+    int LT = findSymbol(tokens, "<");
+    int AMP = findSymbol(tokens, "&");
+
+    struct command *cmd = malloc(sizeof(struct command));
+    memset(cmd, 0, sizeof(struct command));
+
+    if(GT != -1) // if its not -1 then GT is holding the index of '>'
+    {
+        cmd->output_file = strdup(tokens[GT+1]);
+    }
+
+    if(LT != -1) // if its not -1 then LT is holding the index of '<'
+    {
+        cmd->input_file = strdup(tokens[LT+1]);
+    }
+
+    if(AMP != -1) // if its not -1 then GT is holding the index of '>'
+    {
+        cmd->is_bg = 1;
+    }
+
+    for(int i = 0 ; i< MAX_ARGS; i++)
+    {
+        if(!tokens[i])
+        {
+            break;
+        }
+
+        if(i == GT || i==LT || i ==AMP)
+        {
+            break;
+        }
+        cmd->args[i] = strdup(tokens[i]); // if it hits here, then it is an argument (not > < &)
+    }
+
+        cmd->command = strdup(cmd->args[0]); //command name is the first argument ex. echo 123, echo is being duplicated. 
+        return cmd;
+}
+
+/**********************************************************************************
+* Purpose: used in read_line() to check background processes and its status and if theres something terminated, get its pid. 
+* Input: None
+* Output/return type: void
+**********************************************************************************/
+void check_background()
+{
+    int status;
+    int pid;
+    while((pid = waitpid(-1, &status, WNOHANG)) > 0) //look through, while theres something terminated, get the pid and print. Removes already terminated processes.
+    {
+        printf("child with PID %d terminated\n", pid);
+        print_status(status);
+    }
+}
+
+/**********************************************************************************
+* Purpose: used in main() to begin process to parse the line that was entered in command line
+* Input: None
+* Output/return type: struct command
+**********************************************************************************/
+struct command * read_line()
+{
+    char* inputLine = NULL;
+    size_t len = 0;
+
+    GET_INPUT:
+    check_background();
+    printf(": ");
+    fflush(stdout);
+    getline(&inputLine, &len, stdin); // get a line from stdin and put it into inputLine. Getline is doing malloc on inputLine. 
+
+    if(ferror(stdin))       //is there an error in the input
+    {
+        clearerr(stdin);
+        goto GET_INPUT;
+    }
+
+    if(!isValid(inputLine)) //it is not valid
+    {
+        inputLine = NULL;
+        len = 0;
+        goto GET_INPUT;
+    }
+
+    assert(inputLine);
+    assert(len > 0);
+    struct command* cmd = parseLine(inputLine); 
+    free(inputLine);
+
+    return cmd;
+}
+
+// Source: Used information and code from Module 5 Exploration: Processes and I/O
+/**********************************************************************************
+* Purpose: used in run_external(), used for redirection of input and outputs
+* Input: struct command
+* Output/return type: void
+**********************************************************************************/
+void redirectionIO(struct command* cmd)
+{
+    int inFileDescriptor;
+    int outFileDescriptor;
+
+    if(cmd->input_file != '\0')
+    {
+        inFileDescriptor = open(cmd->input_file, O_RDONLY);
+
+        if(inFileDescriptor == -1)
+        {
+            printf("cannot open %s for input\n", cmd->input_file);
+            exit(1);
+        }
+
+        dup2(inFileDescriptor, 0);
+        close(inFileDescriptor);
+    }
+
+    if(cmd->output_file != '\0') // if empty, it will ignore this condition.
+    {
+        outFileDescriptor = open(cmd->output_file,O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+        if(outFileDescriptor == -1)
+        {
+            //perror("redirectIO MSG: Unable to open the output file\n");
+            exit(1);
+        }
+
+        dup2(outFileDescriptor, 1);
+        close(outFileDescriptor);
+    }
+}
+
+/**********************************************************************************
+* Purpose: used in main(), process to creating child and parent processes, handles some signal functions, and redirection of input and output.
+* Input: struct command, struct sigaction, struct sigaction
+* Output/return type: int
+**********************************************************************************/
+int run_external(struct command *cmd, struct sigaction sa, struct sigaction saz)
+{
+    pid_t spawn_pid = -1;
+    spawn_pid = fork();
+    switch(spawn_pid)
+    {
+        case -1: // fork failed, it will return -1
+            perror("fork() failed\n");
+            exit(1);
+            break;
+
+        case 0: // in the child process
+            // set control C handler, if the process is foreground, 
+            if(!cmd->is_bg || !allowBG) // if im in the child, and not the background process, then turn on Ctrl C. 
+            {
+                sa.sa_handler = SIG_DFL;
+                sigaction(SIGINT, &sa, NULL);
+
+
+                saz.sa_handler = SIG_IGN;
+                sigset_t newmask;
+                
+                sigsetmost(&newmask);
+                saz.sa_mask = newmask;
+                sigaction(SIGTSTP, &saz, NULL);
+            }
+            //redirect input and output if needed todo:
+            redirectionIO(cmd);
+
+            if(execvp(cmd->command, cmd->args))
+            {
+                //fprintf(stderr,"Command failed: %s\n", cmd->command);
+                printf("%s: no such file or directory\n", cmd->command);
+                //perror("execvp failed\n");
+                exit(1);
+            } 
+            break;
+        default: // in the parent, 
+            //if user put amp, we dont want to wait.
+            //add_process(spawn_pid);
+            if(!cmd->is_bg || !allowBG)
+            {
+                waitpid(spawn_pid, &lastExitStatus,0);
+                checkForeground(lastExitStatus); 
+            }
+            else
+            {
+                add_process(spawn_pid);
+                printf("Background pid is %d\n", spawn_pid);
+            }
+    }
+    return 0;
+}
+
+/**********************************************************************************
+* Purpose: used in run_external() to check foreground processes and prints signal number.
+* Input: int
+* Output/return type: void
+**********************************************************************************/
+void checkForeground(int status)
+{
+    if(!WIFEXITED(status))
+    {
+        printf("terminated by signal %d\n", WTERMSIG(status));
+    }
+}
+
+/**********************************************************************************
+* Purpose: used in main() to run built in commands like 'cd', 'status', 'exit', and set/change to home directory.
+* Input: struct command
+* Output/return type: void
+**********************************************************************************/
+void run_build_in(struct command *cmd)
+{
+     if (!strcmp(cmd->command, "cd"))
+     {
+        if(cmd->args[1] == NULL) // entering JUST 'cd'
+        {
+            chdir(getenv("HOME")); 
+        }
+        else
+        {
+            chdir(cmd->args[1]); // changing the directory if they give an argument after cd
+        }
+     } 
+ 
+     else if(!strcmp(cmd->command, "status"))
+     {
+         print_status(lastExitStatus);
+     } 
+
+     else if(!strcmp(cmd->command, "exit"))
+     {
+        exit_func();
+     }
+}
+
+/**********************************************************************************
+* Purpose: helper function used in main() as a conditional for running  run_build_in() function. checks if command entered is cd, status, or exit
+* Input: char*
+* Output/return type: int
+**********************************************************************************/
+int is_built_in(char* s)
+{
+    if (!strcmp(s, "cd") || !strcmp(s, "status") || !strcmp(s, "exit"))
+    {
+        return 1;
+    }
+    return 0;
+}
+
+/**********************************************************************************
+* Purpose: helper function in expand_token() to get pid number
+* Input: none
+* Output/return type: char*
+**********************************************************************************/
+char *get_pid_str() 
+{
+    int pid = getpid();
+    char *s = malloc(32);
+    sprintf(s, "%d", pid);
+    return s;
+}
+
+/**********************************************************************************
+* Purpose: helper function used in parse_line(), used to replace $$ with a pid number.
+* Input: char*
+* Output/return type: char*
+**********************************************************************************/
+char *expand_token(char *s) //
+{
+    const char* term = "$$";
+	const char *replace = get_pid_str();
+	
+    if (!strstr(s, term)) {
+        return strdup(s);
+    }
+  
+    // line will be <= incoming line length, as len(^) < len(++)
+    char *buf = malloc(1024);
+    char* p = NULL;
+    char* rest = s;    
+    while ((p = strstr(rest, term))) {
+        strncat(buf, rest, (size_t)(p - rest));
+        strcat(buf, replace);
+        rest = p + strlen(term);
+    }    
+    strcat(buf, rest);
+    return buf;   
+}
+
+/**********************************************************************************
+* Purpose: sets signals, goes a do-while loop and uses read_line() to get command line enetered, 
+*   run_build_in() to check for cd/status/exit, and run_external for other command lines.
+* Input: none
+* Output/return type: int
+**********************************************************************************/
+int main()
+{
+    //ignores C
+    struct sigaction sigint = {{0}};
+    sigint.sa_handler = SIG_IGN;
+    sigint.sa_flags = 0;
+    sigaction(SIGINT, &sigint, NULL);
+
+    //Directs Z
+    struct sigaction sigtstp = {{0}};
+    sigtstp.sa_handler = &handle_sigtstp;
+    sigtstp.sa_flags = 0;
+    sigaction(SIGTSTP, &sigtstp, NULL);
+
+    do {
+        struct command *cmd = read_line();
+        print_command(cmd);
+
+        if(is_built_in(cmd->command))
+        {
+            run_build_in(cmd);
+        }
+        else
+        {
+            run_external(cmd, sigint, sigtstp);
+        }
+        
+    } while(1);
+    return 0;
+}
