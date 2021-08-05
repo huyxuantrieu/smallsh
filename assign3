@@ -4,7 +4,7 @@
  *   CS344: OS1 Summer 2021
  *   Assignment3 : smallsh 
  *   Sources: Office Hours with Michael Slater, Chris Buss, Modules 4 and 5 on Canvas, programiz.com, man7.org, geeksforgeeks and stackoverflow.
- COMPILATION: gcc -std=c11 -Wall -Werror -g3 ass3.c -o smallsh
+ COMPILATION: gcc -std=c11 -Wall -Werror -g3 assign3.c -o smallsh
  execution: smallsh
 **********************************************************************************/
 
